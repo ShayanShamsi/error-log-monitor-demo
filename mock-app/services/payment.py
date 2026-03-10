@@ -5,8 +5,8 @@ from decimal import Decimal
 
 def calculate_discount(price: float, discount_pct: float) -> float:
     """Calculate discounted price. discount_pct should be 0-100."""
-    # BUG: No guard against discount_pct == 100, causes ZeroDivisionError
-    # when someone applies a 100% coupon code
+    if discount_pct >= 100:
+        raise ValueError(f"discount_pct must be < 100, got {discount_pct}")
     multiplier = 100 / (100 - discount_pct)
     return price / multiplier
 
