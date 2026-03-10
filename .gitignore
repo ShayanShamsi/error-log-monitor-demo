@@ -1,0 +1,7 @@
+logs/
+monitor/.log_cursor
+monitor/.opened_prs.json
+**/__pycache__/
+**/.venv/
+*.pyc
+.uv/
