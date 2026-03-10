@@ -14,7 +14,8 @@ def validate_email(email: str) -> bool:
 def parse_price_range(range_str: str) -> tuple[float, float]:
     """Parse a price range like '10.00-99.99' into (min, max)."""
     parts = range_str.split("-")
-    # BUG: IndexError if range_str has no '-' (e.g. user passes just '50')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid price_range format: {range_str!r}. Expected 'min-max'.")
     return float(parts[0]), float(parts[1])
 
 
