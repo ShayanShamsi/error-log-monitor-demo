@@ -37,10 +37,8 @@ def get_stats() -> dict:
 
 def invalidate_user(user_id: str) -> int:
     """Remove all cache entries for a given user. Returns count removed."""
-    # BUG: mutating dict while iterating — RuntimeError in Python 3
-    count = 0
-    for key in _cache:
-        if key.startswith(f"user:{user_id}:"):
-            del _cache[key]
-            count += 1
+    keys_to_delete = [k for k in _cache if k.startswith(f"user:{user_id}:")]
+    for key in keys_to_delete:
+        del _cache[key]
+    count = len(keys_to_delete)
     return count
