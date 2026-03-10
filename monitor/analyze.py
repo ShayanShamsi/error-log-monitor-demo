@@ -26,8 +26,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -108,10 +106,140 @@ def read_source(repo_dir: Path, rel_path: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Test-mode canned analysis (bypasses Claude for pipeline smoke-testing)
+# ---------------------------------------------------------------------------
+
+_CANNED: dict[str, dict] = {
+    "ERR_INDEX_PRICE_RANGE": {
+        "actionable": True,
+        "pr_title": "fix: guard parse_price_range against missing hyphen separator",
+        "pr_body": (
+            "## Problem\n`parse_price_range` crashes with `IndexError` when the caller "
+            "omits the `-` separator (e.g. `?price_range=50`).\n\n"
+            "## Root cause\n`parts = range_str.split('-')` produces a 1-element list; "
+            "`parts[1]` raises `IndexError`.\n\n"
+            "## Fix\nValidate that `parts` has exactly 2 elements before indexing, "
+            "and raise a descriptive `ValueError` otherwise.\n\n"
+            "## Test suggestions\n- `parse_price_range('10.00-99.99')` → `(10.0, 99.99)`\n"
+            "- `parse_price_range('50')` → raises `ValueError`\n"
+            "- `parse_price_range('')` → raises `ValueError`\n"
+        ),
+        "fixed_source": None,  # filled in by _canned_analysis
+        "fix_description": "Add length check before indexing parts to prevent IndexError.",
+    },
+    "ERR_ZERO_DIV_DISCOUNT": {
+        "actionable": True,
+        "pr_title": "fix: raise ValueError when discount_pct==100 in calculate_discount",
+        "pr_body": (
+            "## Problem\n`calculate_discount(price, 100)` raises `ZeroDivisionError` "
+            "because `100 / (100 - 100)` → division by zero.\n\n"
+            "## Root cause\nNo guard against `discount_pct >= 100`.\n\n"
+            "## Fix\nAdd an explicit check at the top of the function and raise "
+            "`ValueError` with a clear message.\n\n"
+            "## Test suggestions\n- `calculate_discount(100, 50)` → `50.0`\n"
+            "- `calculate_discount(100, 100)` → raises `ValueError`\n"
+            "- `calculate_discount(100, 0)` → `100.0`\n"
+        ),
+        "fixed_source": None,
+        "fix_description": "Guard against discount_pct == 100 to avoid ZeroDivisionError.",
+    },
+    "ERR_NONE_USER_BALANCE": {
+        "actionable": True,
+        "pr_title": "fix: raise NotFoundError when user is None in update_user_balance",
+        "pr_body": (
+            "## Problem\n`update_user_balance` silently receives `None` from `get_user` "
+            "for unknown user IDs, then crashes with `TypeError`.\n\n"
+            "## Root cause\n`_USERS.get(user_id)` returns `None`; no guard before "
+            "`user['balance'] += delta`.\n\n"
+            "## Fix\nCheck for `None` after `get_user` and raise `KeyError` with the "
+            "unknown `user_id`.\n\n"
+            "## Test suggestions\n- `update_user_balance('u001', 10)` → no error\n"
+            "- `update_user_balance('unknown', 10)` → raises `KeyError`\n"
+        ),
+        "fixed_source": None,
+        "fix_description": "Check for None return value before mutating user balance.",
+    },
+    "ERR_RUNTIME_CACHE_INVALIDATE": {
+        "actionable": True,
+        "pr_title": "fix: iterate over list copy in invalidate_user to avoid RuntimeError",
+        "pr_body": (
+            "## Problem\n`invalidate_user` raises `RuntimeError: dictionary changed size "
+            "during iteration` because it deletes keys while iterating `_cache`.\n\n"
+            "## Root cause\nPython does not allow mutating a dict during iteration.\n\n"
+            "## Fix\nCollect matching keys first (`list(_cache.keys())`), then delete "
+            "them in a second pass.\n\n"
+            "## Test suggestions\n- Populate cache with several `user:X:*` keys, call "
+            "`invalidate_user('X')`, verify count and that keys are gone.\n"
+        ),
+        "fixed_source": None,
+        "fix_description": "Collect keys to delete in a list first, then delete in a second pass.",
+    },
+    "ERR_SPLIT_ZERO_INSTALLMENTS": {
+        "actionable": True,
+        "pr_title": "fix: validate num_installments > 0 in split_payment",
+        "pr_body": (
+            "## Problem\n`split_payment(total, 0)` raises `ZeroDivisionError`.\n\n"
+            "## Root cause\nNo validation that `num_installments` is positive before "
+            "dividing.\n\n"
+            "## Fix\nRaise `ValueError` at function entry when `num_installments <= 0`.\n\n"
+            "## Test suggestions\n- `split_payment(100, 4)` → `[25.0, 25.0, 25.0, 25.0]`\n"
+            "- `split_payment(100, 0)` → raises `ValueError`\n"
+            "- `split_payment(100, -1)` → raises `ValueError`\n"
+        ),
+        "fixed_source": None,
+        "fix_description": "Raise ValueError when num_installments <= 0.",
+    },
+}
+
+# Minimal source patches applied in test mode
+_SOURCE_PATCHES: dict[str, tuple[str, str]] = {
+    "ERR_INDEX_PRICE_RANGE": (
+        "    parts = range_str.split(\"-\")\n    # BUG: IndexError if range_str has no '-' (e.g. user passes just '50')\n    return float(parts[0]), float(parts[1])",
+        "    parts = range_str.split(\"-\")\n    if len(parts) != 2:\n        raise ValueError(f\"Invalid price_range format: {range_str!r}. Expected 'min-max'.\")\n    return float(parts[0]), float(parts[1])",
+    ),
+    "ERR_ZERO_DIV_DISCOUNT": (
+        "    # BUG: No guard against discount_pct == 100, causes ZeroDivisionError\n    # when someone applies a 100% coupon code\n    multiplier = 100 / (100 - discount_pct)",
+        "    if discount_pct >= 100:\n        raise ValueError(f\"discount_pct must be < 100, got {discount_pct}\")\n    multiplier = 100 / (100 - discount_pct)",
+    ),
+    "ERR_NONE_USER_BALANCE": (
+        "    user = _USERS.get(user_id)\n    # BUG: user could be None here, causing TypeError\n    user[\"balance\"] += delta",
+        "    user = _USERS.get(user_id)\n    if user is None:\n        raise KeyError(f\"User not found: {user_id}\")\n    user[\"balance\"] += delta",
+    ),
+    "ERR_RUNTIME_CACHE_INVALIDATE": (
+        "    # BUG: mutating dict while iterating — RuntimeError in Python 3\n    count = 0\n    for key in _cache:\n        if key.startswith(f\"user:{user_id}:\"):\n            del _cache[key]\n            count += 1",
+        "    keys_to_delete = [k for k in _cache if k.startswith(f\"user:{user_id}:\")]\n    for key in keys_to_delete:\n        del _cache[key]\n    count = len(keys_to_delete)",
+    ),
+    "ERR_SPLIT_ZERO_INSTALLMENTS": (
+        "    # BUG: ZeroDivisionError when num_installments=0 (allowed by frontend)\n    per_installment = total / num_installments",
+        "    if num_installments <= 0:\n        raise ValueError(f\"num_installments must be > 0, got {num_installments}\")\n    per_installment = total / num_installments",
+    ),
+}
+
+
+def _canned_analysis(group: dict, source: str | None) -> dict:
+    eid = group["error_id"]
+    base = _CANNED.get(eid)
+    if base is None:
+        return {"actionable": False, "reason": "no canned analysis for this error_id"}
+
+    result = dict(base)
+
+    # Apply patch to source
+    if source and eid in _SOURCE_PATCHES:
+        old, new = _SOURCE_PATCHES[eid]
+        if old in source:
+            result["fixed_source"] = source.replace(old, new, 1)
+        else:
+            result["fixed_source"] = source  # unchanged fallback
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Claude analysis
 # ---------------------------------------------------------------------------
 
-def analyze_with_claude(client: anthropic.Anthropic, group: dict, source: str | None) -> dict | None:
+def analyze_with_claude(group: dict, source: str | None) -> dict | None:
     """
     Ask Claude to produce:
       - a one-line PR title
@@ -119,6 +247,7 @@ def analyze_with_claude(client: anthropic.Anthropic, group: dict, source: str | 
       - the fixed source file contents (if source was provided)
       - the file path that was fixed
     Returns a dict or None if not actionable.
+    Uses the `claude` CLI (already authenticated via Claude Code).
     """
     source_section = (
         f"\n\nSOURCE FILE ({group['file']}):\n```python\n{source}\n```"
@@ -167,13 +296,16 @@ TASK
 Respond ONLY with the JSON object, no other text.
 """
 
-    response = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
+    # Use the claude CLI (authenticated via Claude Code) to avoid needing ANTHROPIC_API_KEY
+    result = subprocess.run(
+        ["claude", "-p", "--output-format", "text", prompt],
+        capture_output=True, text=True, timeout=120,
     )
+    if result.returncode != 0:
+        print(f"[WARN] claude CLI failed for {group['error_id']}: {result.stderr[:200]}", file=sys.stderr)
+        return None
 
-    text = response.content[0].text.strip()
+    text = result.stdout.strip()
     # Strip potential markdown code fence
     if text.startswith("```"):
         text = text.split("```")[1]
@@ -290,6 +422,7 @@ def main():
     parser.add_argument("--repo-dir", default="../mock-app",             help="Path to mock-app git repo")
     parser.add_argument("--gh-repo",  required=True,                     help="GitHub repo slug (owner/name)")
     parser.add_argument("--dry-run",  action="store_true",               help="Analyze but don't open PRs")
+    parser.add_argument("--test-mode", action="store_true",              help="Skip Claude call; use canned analysis to test PR pipeline")
     parser.add_argument("--reset-cursor", action="store_true",           help="Re-read entire log from start")
     args = parser.parse_args()
 
@@ -323,8 +456,7 @@ def main():
         print("[INFO] No actionable errors this window.", file=sys.stderr)
         return
 
-    # ── 3. Initialize clients / state ────────────────────────────────────
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+    # ── 3. Initialize state ──────────────────────────────────────────────
     opened_prs = load_opened_prs()
     prs_this_run = 0
 
@@ -355,7 +487,10 @@ def main():
         source = read_source(repo_dir, group["file"])
 
         # ── 5. Claude analysis ───────────────────────────────────────────
-        analysis = analyze_with_claude(client, group, source)
+        if args.test_mode:
+            analysis = _canned_analysis(group, source)
+        else:
+            analysis = analyze_with_claude(group, source)
         if analysis is None:
             report_lines.append(f"- **{eid}** ({group['count']}x) — Claude analysis failed.")
             continue
