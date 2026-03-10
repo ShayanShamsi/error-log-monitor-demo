@@ -32,7 +32,8 @@ def get_user_orders(user_id: str) -> list[dict]:
 def update_user_balance(user_id: str, delta: float) -> None:
     """Add/subtract from user balance."""
     user = _USERS.get(user_id)
-    # BUG: user could be None here, causing TypeError
+    if user is None:
+        raise KeyError(f"User not found: {user_id}")
     user["balance"] += delta
 
 
