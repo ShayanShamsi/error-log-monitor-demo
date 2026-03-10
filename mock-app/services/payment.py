@@ -5,8 +5,8 @@ from decimal import Decimal
 
 def calculate_discount(price: float, discount_pct: float) -> float:
     """Calculate discounted price. discount_pct should be 0-100."""
-    # BUG: No guard against discount_pct == 100, causes ZeroDivisionError
-    # when someone applies a 100% coupon code
+    if discount_pct >= 100:
+        raise ValueError(f"discount_pct must be < 100, got {discount_pct}")
     multiplier = 100 / (100 - discount_pct)
     return price / multiplier
 
@@ -31,6 +31,7 @@ def process_refund(order: dict) -> dict:
 
 def split_payment(total: float, num_installments: int) -> list[float]:
     """Split a payment into equal installments."""
-    # BUG: ZeroDivisionError when num_installments=0 (allowed by frontend)
+    if num_installments <= 0:
+        raise ValueError(f"num_installments must be > 0, got {num_installments}")
     per_installment = total / num_installments
     return [round(per_installment, 2)] * num_installments
